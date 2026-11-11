@@ -1,6 +1,7 @@
 """Các provider cùng một interface. Không chứa agent loop."""
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -14,16 +15,30 @@ CONFIG = {
 }
 
 
-def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
+def post_json(url, headers, payload, retries=4):
+    """POST JSON; retry có backoff với 429/503/5xx và lỗi mạng tạm thời."""
+    body = json.dumps(payload).encode()
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json', **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            # Do not print response bodies: they may contain account or request data.
+            if exc.code in (408, 429, 500, 502, 503, 504) and attempt < retries:
+                wait = exc.headers.get('Retry-After') if exc.headers else None
+                try:
+                    wait = float(wait)
+                except (TypeError, ValueError):
+                    wait = min(2 ** attempt * 3, 30)
+                time.sleep(min(max(wait, 1.0), 30.0))
+                continue
+            raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        except urllib.error.URLError as exc:
+            if attempt < retries:
+                time.sleep(min(2 ** attempt, 15))
+                continue
+            raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
 
 class Provider:
